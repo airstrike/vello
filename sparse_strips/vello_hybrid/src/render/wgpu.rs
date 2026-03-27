@@ -832,6 +832,10 @@ struct Programs {
     clear_pipeline: RenderPipeline,
     /// Pipeline for clearing atlas regions.
     atlas_clear_pipeline: RenderPipeline,
+    /// Pipeline for blitting between textures with format conversion (backdrop capture).
+    blit_pipeline: RenderPipeline,
+    /// Bind group layout for the blit pipeline's source texture + sampler.
+    blit_bind_group_layout: BindGroupLayout,
     /// GPU resources for rendering (created during prepare)
     resources: GpuResources,
     /// Dimensions of the rendering target
@@ -1530,6 +1534,92 @@ impl Programs {
             view_config_buffer,
         };
 
+        // Blit pipeline for format-converting texture copies (backdrop blur capture).
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Blit Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_samp: sampler;
+
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VOut {
+    var out: VOut;
+    let x = f32(i & 1u) * 2.0;
+    let y = f32((i >> 1u) & 1u) * 2.0;
+    out.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    out.uv = vec2<f32>(x, y);
+    return out;
+}
+
+@fragment fn fs(in: VOut) -> @location(0) vec4<f32> {
+    return textureSample(src_tex, src_samp, in.uv);
+}
+"#
+                .into(),
+            ),
+        });
+
+        let blit_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Blit Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Blit Pipeline Layout"),
+            bind_group_layouts: &[&blit_bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Blit Pipeline"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    // Target the filter atlas format (always Rgba8Unorm).
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             strip_pipelines,
             strip_bind_group_layout,
@@ -1548,6 +1638,8 @@ impl Programs {
             },
             clear_pipeline,
             atlas_clear_pipeline,
+            blit_pipeline,
+            blit_bind_group_layout,
         }
     }
 
@@ -2433,13 +2525,6 @@ impl RendererContext<'_> {
 
         let pipeline_idx = match target {
             StripPassRenderTarget::Output(OutputTarget::IntermediateTexture(_)) => 1,
-            // When rendering to the backdrop intermediate texture (which is RGBA8),
-            // use pipeline[1] (RGBA8 format) instead of pipeline[0] (native format).
-            StripPassRenderTarget::Output(OutputTarget::FinalView)
-                if self.backdrop_texture.is_some() =>
-            {
-                1
-            }
             _ => 0,
         };
 
@@ -2571,34 +2656,64 @@ impl RendererBackend for RendererContext<'_> {
         let dst_x = initial_resource.offset[0] as u32;
         let dst_y = initial_resource.offset[1] as u32;
 
-        // Copy the region from the intermediate output texture to the filter atlas.
-        self.encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: backdrop_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: src_x,
-                    y: src_y,
-                    z: 0,
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        // Blit from intermediate (surface format) → filter atlas (Rgba8Unorm)
+        // using a render pass instead of copy_texture_to_texture, since the
+        // formats may differ (e.g. Bgra8UnormSrgb vs Rgba8Unorm on macOS).
+        let src_view = backdrop_tex.create_view(&TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            ..Default::default()
+        });
+
+        let blit_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Backdrop Blit Bind Group"),
+            layout: &self.programs.blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&src_view),
                 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &filter_atlas.textures[atlas_idx],
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: dst_x,
-                    y: dst_y,
-                    z: 0,
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&filter_atlas.sampler),
                 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+            ],
+        });
+
+        let dst_view = filter_atlas.textures[atlas_idx].create_view(&TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            ..Default::default()
+        });
+
+        {
+            let mut pass = self.encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Backdrop Blit Pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &dst_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            // Set viewport to the destination region in the filter atlas.
+            pass.set_viewport(dst_x as f32, dst_y as f32, width as f32, height as f32, 0.0, 1.0);
+            // Set scissor to avoid drawing outside the destination.
+            pass.set_scissor_rect(dst_x, dst_y, width, height);
+            pass.set_pipeline(&self.programs.blit_pipeline);
+            pass.set_bind_group(0, &blit_bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
     }
 
     fn apply_filter(&mut self, layer_id: LayerId) {
