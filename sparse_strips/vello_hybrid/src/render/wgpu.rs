@@ -371,7 +371,7 @@ impl Renderer {
         view: &TextureView,
         encoded_paints: &[EncodedPaint],
         clear: bool,
-        output_texture: Option<&Texture>,
+        _output_texture: Option<&Texture>,
     ) -> Result<(), RenderError> {
         self.prepare_gpu_encoded_paints(encoded_paints);
         self.programs.prepare(
@@ -441,30 +441,48 @@ impl Renderer {
             encoded_paints,
         )?;
 
-        // If we rendered to an intermediate texture, copy the result to the output.
+        // If we rendered to an intermediate texture, blit it to the final view.
+        // We use a render pass (not copy_texture_to_texture) because swapchain
+        // textures typically don't support COPY_DST.
         if has_backdrop_filters {
-            if let (Some(backdrop_tex), Some(output_tex)) =
-                (ctx.backdrop_texture.as_ref(), output_texture)
-            {
-                ctx.encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: backdrop_tex,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: output_tex,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    Extent3d {
-                        width: render_size.width,
-                        height: render_size.height,
-                        depth_or_array_layers: 1,
-                    },
-                );
+            if let Some(ref backdrop_tex) = ctx.backdrop_texture {
+                let src_view = backdrop_tex.create_view(&TextureViewDescriptor::default());
+                let blit_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Final Blit Bind Group"),
+                    layout: &ctx.programs.blit_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&src_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(
+                                &ctx.programs.resources.filter_atlas.sampler,
+                            ),
+                        },
+                    ],
+                });
+
+                let mut pass = ctx.encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("Final Blit Pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&ctx.programs.blit_to_surface_pipeline);
+                pass.set_bind_group(0, &blit_bg, &[]);
+                pass.draw(0..4, 0..1);
             }
         }
 
@@ -832,9 +850,11 @@ struct Programs {
     clear_pipeline: RenderPipeline,
     /// Pipeline for clearing atlas regions.
     atlas_clear_pipeline: RenderPipeline,
-    /// Pipeline for blitting between textures with format conversion (backdrop capture).
-    blit_pipeline: RenderPipeline,
-    /// Bind group layout for the blit pipeline's source texture + sampler.
+    /// Pipeline for blitting to the filter atlas (Rgba8Unorm target).
+    blit_to_atlas_pipeline: RenderPipeline,
+    /// Pipeline for blitting to the surface (native format target).
+    blit_to_surface_pipeline: RenderPipeline,
+    /// Bind group layout for blit pipelines' source texture + sampler.
     blit_bind_group_layout: BindGroupLayout,
     /// GPU resources for rendering (created during prepare)
     resources: GpuResources,
@@ -1590,35 +1610,41 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
             immediate_size: 0,
         });
 
-        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Blit Pipeline"),
-            layout: Some(&blit_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &blit_shader,
-                entry_point: Some("vs"),
-                compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &blit_shader,
-                entry_point: Some("fs"),
-                compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState {
-                    // Target the filter atlas format (always Rgba8Unorm).
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_blit_pipeline = |label, fmt| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&blit_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &blit_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &blit_shader,
+                    entry_point: Some("fs"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    targets: &[Some(ColorTargetState {
+                        format: fmt,
+                        blend: None,
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
+        let blit_to_atlas_pipeline =
+            make_blit_pipeline("Blit to Atlas Pipeline", wgpu::TextureFormat::Rgba8Unorm);
+        let blit_to_surface_pipeline =
+            make_blit_pipeline("Blit to Surface Pipeline", render_target_config.format);
 
         Self {
             strip_pipelines,
@@ -1638,7 +1664,8 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
             },
             clear_pipeline,
             atlas_clear_pipeline,
-            blit_pipeline,
+            blit_to_atlas_pipeline,
+            blit_to_surface_pipeline,
             blit_bind_group_layout,
         }
     }
@@ -2710,7 +2737,7 @@ impl RendererBackend for RendererContext<'_> {
             pass.set_viewport(dst_x as f32, dst_y as f32, width as f32, height as f32, 0.0, 1.0);
             // Set scissor to avoid drawing outside the destination.
             pass.set_scissor_rect(dst_x, dst_y, width, height);
-            pass.set_pipeline(&self.programs.blit_pipeline);
+            pass.set_pipeline(&self.programs.blit_to_atlas_pipeline);
             pass.set_bind_group(0, &blit_bind_group, &[]);
             pass.draw(0..4, 0..1);
         }
