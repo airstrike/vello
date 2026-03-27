@@ -737,6 +737,20 @@ impl Scene {
     ///
     /// scene.pop_layer();
     /// ```
+    /// Debug: dump scene state for backdrop blur debugging.
+    pub fn debug_backdrop_state(&self) -> alloc::string::String {
+        use alloc::format;
+        let mut s = format!("backdrop_filters: {:?}\n", self.backdrop_filters);
+        s += &format!("coarse_batch_splits: {:?}\n", self.coarse_batch_splits);
+        s += &format!("strip_path_mode: {:?}\n", self.strip_path_mode);
+        s += &format!("fast_strips_buffer commands: {}\n", self.fast_strips_buffer.commands.len());
+        s += &format!("render_graph nodes: {}\n", self.render_graph.nodes.len());
+        for (i, node) in self.render_graph.nodes.iter().enumerate() {
+            s += &format!("  node[{}]: kind={:?} empty={}\n", i, core::mem::discriminant(&node.kind), node.is_empty());
+        }
+        s
+    }
+
     pub fn push_backdrop_filter_layer(&mut self, filter: Filter) {
         let mut backdrop_filter = filter;
         backdrop_filter.is_backdrop = true;

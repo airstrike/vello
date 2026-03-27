@@ -99,6 +99,8 @@ pub struct Renderer {
     filter_context: FilterContext,
     /// State used for constructing filter passes.
     filter_pass_state: FilterPassState,
+    /// The surface/render target format.
+    surface_format: wgpu::TextureFormat,
 }
 
 impl Renderer {
@@ -141,6 +143,7 @@ impl Renderer {
             paint_idxs: Vec::new(),
             filter_context,
             filter_pass_state: FilterPassState::default(),
+            surface_format: render_target_config.format,
         }
     }
 
@@ -398,7 +401,7 @@ impl Renderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: self.surface_format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
@@ -895,7 +898,8 @@ impl FilterAtlasState {
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
             let view = texture.create_view(&TextureViewDescriptor::default());
@@ -2555,11 +2559,13 @@ impl RendererBackend for RendererContext<'_> {
         let atlas_idx = initial_resource.atlas_id.as_u32() as usize;
         let filter_atlas = &self.programs.resources.filter_atlas;
 
-        // Calculate the source region in the output texture (pixel coordinates).
-        let src_x = wtile_bbox.x0() as u32 * WideTile::WIDTH as u32;
-        let src_y = wtile_bbox.y0() as u32 * Tile::HEIGHT as u32;
-        let width = wtile_bbox.width_px() as u32;
-        let height = wtile_bbox.height_px() as u32;
+        // Calculate the source region, clamped to the actual texture size.
+        let tex_w = backdrop_tex.width();
+        let tex_h = backdrop_tex.height();
+        let src_x = (wtile_bbox.x0() as u32 * WideTile::WIDTH as u32).min(tex_w);
+        let src_y = (wtile_bbox.y0() as u32 * Tile::HEIGHT as u32).min(tex_h);
+        let width = (wtile_bbox.width_px() as u32).min(tex_w - src_x);
+        let height = (wtile_bbox.height_px() as u32).min(tex_h - src_y);
 
         // Destination offset in the filter atlas (where the initial image lives).
         let dst_x = initial_resource.offset[0] as u32;

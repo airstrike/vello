@@ -882,12 +882,22 @@ impl<const MODE: u8> Wide<MODE> {
                     // Calculate expansion in device/pixel space, accounting for the full transform.
                     // This ensures that rotated filters (e.g., drop shadows) have correct bounds.
                     let expansion = filter.bounds_expansion(&transform);
-                    let expanded_bbox = layer.wtile_bbox.expand_by_pixels(
+                    let clip_bbox = self.active_bbox();
+
+                    // For backdrop filters, the input is the BACKGROUND content
+                    // (not what was drawn inside the layer), so use the full
+                    // clip/scene bbox as the base instead of the layer's content bbox.
+                    let base_bbox = if filter.is_backdrop {
+                        clip_bbox
+                    } else {
+                        layer.wtile_bbox
+                    };
+
+                    let expanded_bbox = base_bbox.expand_by_pixels(
                         expansion,
                         self.width_tiles(),
                         self.height_tiles(),
                     );
-                    let clip_bbox = self.active_bbox();
                     final_bbox = expanded_bbox.intersect(clip_bbox);
 
                     // Update both the local layer and the render graph node
