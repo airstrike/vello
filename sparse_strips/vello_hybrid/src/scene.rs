@@ -24,7 +24,7 @@ use vello_common::peniko::{BlendMode, Compose, Fill, Mix};
 use vello_common::recording::{
     PushLayerCommand, Recordable, Recorder, Recording, RenderCommand, RenderState,
 };
-use vello_common::render_graph::{RenderGraph, RenderNodeKind};
+use vello_common::render_graph::{LayerId, RenderGraph, RenderNodeKind};
 use vello_common::strip::Strip;
 use vello_common::strip_generator::{GenerationMode, StripGenerator, StripStorage};
 use vello_common::util::is_axis_aligned;
@@ -234,6 +234,14 @@ pub struct Scene {
     /// process one coarse batch before processing another fast path strip batch.
     /// Only meaningful in [`StripPathMode::Interleaved`] mode.
     pub(crate) coarse_batch_splits: Vec<usize>,
+    /// Backdrop filter layers that need to be processed inline during root rendering.
+    /// Each entry is (layer_id, coarse_batch_index) indicating which backdrop filter
+    /// should be captured and applied after the given batch is flushed.
+    ///
+    /// The coarse_batch_index corresponds to the batch that contains the content
+    /// BEFORE the backdrop filter. After that batch is fully rendered and flushed,
+    /// the output is captured and the filter is applied.
+    pub(crate) backdrop_filters: Vec<(LayerId, usize)>,
 }
 
 // We use this macro instead of a method to avoid borrowing issues in the corresponding methods.
@@ -321,6 +329,7 @@ impl Scene {
             fast_strips_buffer: FastStripsBuffer::default(),
             strip_path_mode: StripPathMode::FastOnly,
             coarse_batch_splits: Vec::new(),
+            backdrop_filters: Vec::new(),
         }
     }
 
@@ -703,6 +712,43 @@ impl Scene {
         self.push_layer(None, None, None, None, Some(filter));
     }
 
+    /// Push a backdrop filter layer (CSS `backdrop-filter`).
+    ///
+    /// Unlike `push_filter_layer` which filters content drawn *inside* the layer,
+    /// this captures already-rendered content *behind* the layer and applies the
+    /// filter to it. This creates effects like frosted glass.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Draw some background content
+    /// scene.fill_rect(&background_rect);
+    ///
+    /// // Apply a backdrop blur
+    /// scene.push_backdrop_filter_layer(Filter::backdrop_from_primitive(
+    ///     FilterPrimitive::GaussianBlur {
+    ///         std_deviation: 10.0,
+    ///         edge_mode: EdgeMode::None,
+    ///     },
+    /// ));
+    ///
+    /// // Draw a semi-transparent overlay on top of the blurred backdrop
+    /// scene.fill_rect(&overlay_rect);
+    ///
+    /// scene.pop_layer();
+    /// ```
+    pub fn push_backdrop_filter_layer(&mut self, filter: Filter) {
+        let mut backdrop_filter = filter;
+        backdrop_filter.is_backdrop = true;
+        // Record the coarse batch index BEFORE push_layer, since push_layer
+        // may create a new batch boundary. The content rendered before this
+        // point is the backdrop we want to capture.
+        let batch_idx = self.coarse_batch_splits.len();
+        let layer_id = self.layer_id_next + 1; // push_layer increments this
+        self.push_layer(None, None, None, None, Some(backdrop_filter));
+        self.backdrop_filters.push((layer_id, batch_idx));
+    }
+
     /// Pop the last pushed layer.
     pub fn pop_layer(&mut self) {
         self.wide.pop_layer(&mut self.render_graph);
@@ -827,6 +873,7 @@ impl Scene {
         self.fast_strips_buffer.clear();
         self.strip_path_mode = StripPathMode::FastOnly;
         self.coarse_batch_splits.clear();
+        self.backdrop_filters.clear();
 
         self.layer_id_next = 0;
         self.render_graph.clear();

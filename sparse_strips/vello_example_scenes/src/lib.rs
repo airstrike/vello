@@ -54,6 +54,15 @@ pub trait RenderingContext: Sized {
     fn reset_filter_effect(&mut self);
     /// Push a filter layer.
     fn push_filter_layer(&mut self, filter: Filter);
+    /// Push a backdrop filter layer (CSS `backdrop-filter`).
+    ///
+    /// Captures already-rendered content behind the layer and applies a filter
+    /// to it. Creates effects like frosted glass. Default implementation falls
+    /// back to a regular filter layer.
+    fn push_backdrop_filter_layer(&mut self, filter: Filter) {
+        // Default implementation: fall back to regular filter (no backdrop capture).
+        self.push_filter_layer(filter);
+    }
     /// Set the current stroke style.
     fn set_stroke(&mut self, stroke: Stroke);
     /// Fill a path with the current paint.
@@ -214,6 +223,10 @@ impl RenderingContext for Scene {
 
     fn push_filter_layer(&mut self, filter: Filter) {
         self.push_filter_layer(filter);
+    }
+
+    fn push_backdrop_filter_layer(&mut self, filter: Filter) {
+        self.push_backdrop_filter_layer(filter);
     }
 
     fn set_paint(&mut self, paint: impl Into<PaintType>) {

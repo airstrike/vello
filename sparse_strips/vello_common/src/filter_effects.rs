@@ -62,6 +62,13 @@ use smallvec::SmallVec;
 pub struct Filter {
     /// Filter graph defining the effect pipeline.
     pub graph: Arc<FilterGraph>,
+    /// Whether this filter operates on the backdrop (content behind the layer)
+    /// rather than the content drawn inside the layer.
+    ///
+    /// When `true`, this filter captures already-rendered content behind the layer,
+    /// applies the filter to it, and uses the result as the layer's background.
+    /// This is equivalent to CSS `backdrop-filter`.
+    pub is_backdrop: bool,
     // TODO: Add bounds restricting where the filter applies.
     // Optional bounds restricting where the filter applies.
     // If `None`, the filter applies to the entire filtered element.
@@ -97,7 +104,18 @@ impl Filter {
 
         Self {
             graph: Arc::new(graph),
+            is_backdrop: false,
         }
+    }
+
+    /// Create a backdrop filter from a filter primitive.
+    ///
+    /// A backdrop filter applies to content already rendered behind the layer,
+    /// creating effects like frosted glass (CSS `backdrop-filter`).
+    pub fn backdrop_from_primitive(primitive: FilterPrimitive) -> Self {
+        let mut filter = Self::from_primitive(primitive);
+        filter.is_backdrop = true;
+        filter
     }
 
     /// Calculate the bounds expansion for this filter in pixel/device space.

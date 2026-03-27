@@ -269,6 +269,10 @@ impl SingleThreadedDispatcher {
                         fine.pack(region);
                     });
                 }
+                RenderNodeKind::BackdropFilterLayer { .. } => {
+                    // Backdrop filters are not yet implemented in vello_cpu.
+                    // Skip these nodes.
+                }
             }
         }
     }

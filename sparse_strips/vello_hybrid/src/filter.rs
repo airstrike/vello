@@ -718,12 +718,21 @@ impl FilterContext {
                 continue;
             }
 
-            if let RenderNodeKind::FilterLayer {
-                layer_id,
-                filter,
-                transform,
-                wtile_bbox,
-            } = &node.kind
+            let (layer_id, filter, transform, wtile_bbox) = match &node.kind {
+                RenderNodeKind::FilterLayer {
+                    layer_id,
+                    filter,
+                    transform,
+                    wtile_bbox,
+                } => (layer_id, filter, transform, wtile_bbox),
+                RenderNodeKind::BackdropFilterLayer {
+                    layer_id,
+                    filter,
+                    transform,
+                    wtile_bbox,
+                } => (layer_id, filter, transform, wtile_bbox),
+                _ => continue,
+            };
             {
                 let width = wtile_bbox.width_px() as u32;
                 let height = wtile_bbox.height_px() as u32;

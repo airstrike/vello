@@ -732,14 +732,24 @@ impl<const MODE: u8> Wide<MODE> {
         // Build render graph node ONLY if we have a filter.
         // The render graph tracks dependencies and execution order for filter effects.
         if let Some(filter) = &filter {
-            // Create a FilterLayer node that combines render + filter + other operations
-            let child_node = render_graph.add_node(RenderNodeKind::FilterLayer {
-                layer_id,
-                filter: filter.clone(),
-                // Bounding box starts inverted and will be updated in pop_layer with actual bounds
-                wtile_bbox: WideTilesBbox::inverted(),
-                transform,
-            });
+            // Create the appropriate node kind based on whether this is a backdrop filter.
+            let node_kind = if filter.is_backdrop {
+                RenderNodeKind::BackdropFilterLayer {
+                    layer_id,
+                    filter: filter.clone(),
+                    wtile_bbox: WideTilesBbox::inverted(),
+                    transform,
+                }
+            } else {
+                RenderNodeKind::FilterLayer {
+                    layer_id,
+                    filter: filter.clone(),
+                    // Bounding box starts inverted and will be updated in pop_layer with actual bounds
+                    wtile_bbox: WideTilesBbox::inverted(),
+                    transform,
+                }
+            };
+            let child_node = render_graph.add_node(node_kind);
 
             // Connect to parent node if there is one
             if let Some(&parent_node) = self.filter_node_stack.last() {
@@ -852,17 +862,26 @@ impl<const MODE: u8> Wide<MODE> {
 
             // Update render graph node with final bounding box
             if let Some(node_id) = self.filter_node_stack.pop() {
-                // Get the transform from the FilterLayer node and scale the expansion by it
-                if let Some(node) = render_graph.nodes.get_mut(node_id)
-                    && let RenderNodeKind::FilterLayer {
-                        wtile_bbox,
-                        transform,
-                        ..
-                    } = &mut node.kind
-                {
+                // Get the transform and wtile_bbox from the filter node (either
+                // FilterLayer or BackdropFilterLayer) and scale the expansion by it.
+                if let Some(node) = render_graph.nodes.get_mut(node_id) {
+                    let (wtile_bbox, transform) = match &mut node.kind {
+                        RenderNodeKind::FilterLayer {
+                            wtile_bbox,
+                            transform,
+                            ..
+                        } => (wtile_bbox, *transform),
+                        RenderNodeKind::BackdropFilterLayer {
+                            wtile_bbox,
+                            transform,
+                            ..
+                        } => (wtile_bbox, *transform),
+                        _ => unreachable!("filter node stack should only contain filter nodes"),
+                    };
+
                     // Calculate expansion in device/pixel space, accounting for the full transform.
                     // This ensures that rotated filters (e.g., drop shadows) have correct bounds.
-                    let expansion = filter.bounds_expansion(transform);
+                    let expansion = filter.bounds_expansion(&transform);
                     let expanded_bbox = layer.wtile_bbox.expand_by_pixels(
                         expansion,
                         self.width_tiles(),

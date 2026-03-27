@@ -249,6 +249,11 @@ pub(crate) trait RendererBackend {
 
     /// Apply filter effects for the given layer after its content has been rendered.
     fn apply_filter(&mut self, layer_id: LayerId);
+
+    /// Capture the current output within the given bounds and copy it into the
+    /// filter layer's initial texture. This is used for backdrop filters where the
+    /// filter input is the already-rendered content behind the layer.
+    fn capture_backdrop(&mut self, layer_id: LayerId, wtile_bbox: WideTilesBbox);
 }
 
 /// Backend agnostic enum that specifies the operation to perform to the output attachment at the
@@ -536,6 +541,13 @@ impl Scheduler {
                         encoded_paints,
                     )?;
                 }
+                RenderNodeKind::BackdropFilterLayer { .. } => {
+                    // Backdrop filter nodes are NOT processed in the pre-pass.
+                    // They are handled inline during root layer processing:
+                    // after the preceding content has been flushed to the output,
+                    // the output region is captured and filtered.
+                    continue;
+                }
             }
 
             while !self.rounds_queue.is_empty() {
@@ -627,9 +639,10 @@ impl Scheduler {
             StripPathMode::Interleaved => {
                 // Alternate fast strip batches with coarse-rasterized layer batches.
                 let mut prev_split = 0;
+                let mut backdrop_idx = 0;
 
-                for &split in &scene.coarse_batch_splits {
-                    // First process any direct strips.
+                for (batch_idx, &split) in scene.coarse_batch_splits.iter().enumerate() {
+                    // First process any direct strips (content before the coarse batch).
                     if prev_split < split {
                         self.push_direct_strips(
                             scene,
@@ -639,7 +652,48 @@ impl Scheduler {
                         );
                     }
 
-                    // Then process the coarse batch.
+                    // Check if any backdrop filters need to be captured BEFORE
+                    // processing this coarse batch. Backdrop filters are recorded
+                    // with the batch_idx of the split point that separates the
+                    // preceding fast strips from the coarse batch containing the
+                    // backdrop filter's PushBuf. We must flush all pending rendering,
+                    // capture the output, and apply the filter so the filtered
+                    // result is ready when the coarse batch tries to draw it.
+                    while backdrop_idx < scene.backdrop_filters.len() {
+                        let (layer_id, filter_batch_idx) =
+                            scene.backdrop_filters[backdrop_idx];
+                        if filter_batch_idx != batch_idx {
+                            break;
+                        }
+                        // Flush all pending rounds to ensure the output is up to date.
+                        while !self.rounds_queue.is_empty() {
+                            self.flush(renderer);
+                        }
+                        // Find the bbox for this backdrop filter from the render graph.
+                        let wtile_bbox = scene
+                            .render_graph
+                            .nodes
+                            .iter()
+                            .find_map(|node| match &node.kind {
+                                RenderNodeKind::BackdropFilterLayer {
+                                    layer_id: id,
+                                    wtile_bbox,
+                                    ..
+                                } if *id == layer_id => Some(*wtile_bbox),
+                                _ => None,
+                            })
+                            .unwrap_or(WideTilesBbox::new([0, 0, 0, 0]));
+
+                        if !wtile_bbox.is_empty() {
+                            renderer.capture_backdrop(layer_id, wtile_bbox);
+                            renderer.apply_filter(layer_id);
+                        }
+                        backdrop_idx += 1;
+                    }
+
+                    // Then process the coarse batch. For backdrop filters, this
+                    // batch contains the PushBuf(Filtered(layer_id)) that draws
+                    // the (now-ready) filtered backdrop image.
                     self.process_coarse_batch(
                         state,
                         renderer,

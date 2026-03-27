@@ -148,7 +148,10 @@ impl RenderGraph {
         }
 
         // Track if we have any filters to avoid scanning nodes later
-        if matches!(kind, RenderNodeKind::FilterLayer { .. }) {
+        if matches!(
+            kind,
+            RenderNodeKind::FilterLayer { .. } | RenderNodeKind::BackdropFilterLayer { .. }
+        ) {
             self.has_filters = true;
         }
 
@@ -287,6 +290,7 @@ impl RenderNode {
         match &self.kind {
             RenderNodeKind::RootLayer { wtile_bbox, .. } => wtile_bbox.is_empty(),
             RenderNodeKind::FilterLayer { wtile_bbox, .. } => wtile_bbox.is_empty(),
+            RenderNodeKind::BackdropFilterLayer { wtile_bbox, .. } => wtile_bbox.is_empty(),
         }
     }
 }
@@ -333,6 +337,31 @@ pub enum RenderNodeKind {
         wtile_bbox: WideTilesBbox,
         /// Transform that was active when the layer was created.
         /// Used to scale filter parameters based on the current scale/zoom level.
+        transform: Affine,
+    },
+    /// A backdrop filter layer (CSS `backdrop-filter`).
+    ///
+    /// Unlike `FilterLayer` which filters content drawn *inside* the layer,
+    /// a backdrop filter captures the already-rendered content *behind* the layer
+    /// and applies a filter to it. This creates effects like frosted glass.
+    ///
+    /// The rendering flow is:
+    /// 1. Content before this layer is rendered normally to the output
+    /// 2. The output region within the layer's bounds is captured
+    /// 3. The captured content is filtered (e.g., blurred)
+    /// 4. The filtered result is composited, then the layer's own content is drawn on top
+    ///
+    /// Backdrop filter nodes are NOT processed in the normal render graph execution order.
+    /// Instead, they are processed inline during root layer rendering, after the preceding
+    /// content has been flushed to the output.
+    BackdropFilterLayer {
+        /// ID of this backdrop filter layer.
+        layer_id: LayerId,
+        /// The filter effect to apply to the captured backdrop content.
+        filter: Filter,
+        /// Bounding box in wide tile coordinates for the capture region.
+        wtile_bbox: WideTilesBbox,
+        /// Transform that was active when the layer was created.
         transform: Affine,
     },
 }

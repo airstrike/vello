@@ -46,7 +46,7 @@ use vello_common::image_cache::{ImageCache, ImageResource};
 use vello_common::multi_atlas::{AtlasConfig, AtlasError, AtlasId};
 use vello_common::render_graph::LayerId;
 use vello_common::{
-    coarse::WideTile,
+    coarse::{WideTile, WideTilesBbox},
     encode::{EncodedGradient, EncodedKind, EncodedPaint, MAX_GRADIENT_LUT_SIZE, RadialKind},
     paint::ImageSource,
     peniko,
@@ -209,6 +209,29 @@ impl Renderer {
         render_size: &RenderSize,
         view: &TextureView,
     ) -> Result<(), RenderError> {
+        self.render_to(scene, device, queue, encoder, render_size, view, None)
+    }
+
+    /// Render a scene to the given view, with optional output texture reference
+    /// for backdrop filter support.
+    ///
+    /// When the scene contains backdrop filters, an intermediate RGBA8 texture is
+    /// used for rendering. If `output_texture` is provided, the final result is
+    /// copied back to it via `copy_texture_to_texture`. The output texture must
+    /// have `COPY_DST` usage and be `Rgba8Unorm` format.
+    ///
+    /// If the scene has no backdrop filters, the rendering goes directly to `view`
+    /// and `output_texture` is ignored.
+    pub fn render_to(
+        &mut self,
+        scene: &Scene,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut CommandEncoder,
+        render_size: &RenderSize,
+        view: &TextureView,
+        output_texture: Option<&Texture>,
+    ) -> Result<(), RenderError> {
         let mut encoded_paints = scene.encoded_paints.borrow_mut();
         let scene_paint_count = encoded_paints.len();
 
@@ -226,6 +249,7 @@ impl Renderer {
             view,
             &encoded_paints,
             false,
+            output_texture,
         );
 
         encoded_paints.truncate(scene_paint_count);
@@ -313,6 +337,7 @@ impl Renderer {
             &layer_view,
             &encoded_paints,
             false,
+            None,
         );
 
         // Restore the real atlas bind group.
@@ -343,11 +368,9 @@ impl Renderer {
         view: &TextureView,
         encoded_paints: &[EncodedPaint],
         clear: bool,
+        output_texture: Option<&Texture>,
     ) -> Result<(), RenderError> {
         self.prepare_gpu_encoded_paints(encoded_paints);
-        // TODO: For the time being, we upload the entire alpha buffer as one big chunk. As a future
-        // refinement, we could have a bounded alpha buffer, and break draws when the alpha
-        // buffer fills.
         self.programs.prepare(
             device,
             queue,
@@ -359,18 +382,52 @@ impl Renderer {
             &self.filter_context,
         );
 
-        if clear {
-            Self::clear_view(encoder, view);
+        let has_backdrop_filters = !scene.backdrop_filters.is_empty();
+
+        // When backdrop filters are present, we render to an intermediate RGBA8
+        // texture instead of the final view. This texture has COPY_SRC so we can
+        // capture regions of the rendered content for backdrop filter processing.
+        let backdrop_texture = if has_backdrop_filters {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Backdrop Intermediate Texture"),
+                size: Extent3d {
+                    width: render_size.width,
+                    height: render_size.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            Some(tex)
+        } else {
+            None
+        };
+
+        let backdrop_view: Option<TextureView> = backdrop_texture
+            .as_ref()
+            .map(|tex| tex.create_view(&TextureViewDescriptor::default()));
+
+        let effective_view = backdrop_view.as_ref().unwrap_or(view);
+
+        if clear || has_backdrop_filters {
+            Self::clear_view(encoder, effective_view);
         }
         let mut ctx = RendererContext {
             programs: &mut self.programs,
             device,
             queue,
             encoder,
-            view,
+            view: effective_view,
             image_cache: &self.image_cache,
             filter_context: &self.filter_context,
             filter_pass_state: &mut self.filter_pass_state,
+            backdrop_texture,
         };
         self.scheduler.do_scene(
             &mut self.scheduler_state,
@@ -380,6 +437,34 @@ impl Renderer {
             &self.filter_context,
             encoded_paints,
         )?;
+
+        // If we rendered to an intermediate texture, copy the result to the output.
+        if has_backdrop_filters {
+            if let (Some(backdrop_tex), Some(output_tex)) =
+                (ctx.backdrop_texture.as_ref(), output_texture)
+            {
+                ctx.encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: backdrop_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: output_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    Extent3d {
+                        width: render_size.width,
+                        height: render_size.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+
         self.gradient_cache.maintain();
 
         Ok(())
@@ -2210,7 +2295,12 @@ struct RendererContext<'a> {
     image_cache: &'a ImageCache,
     filter_context: &'a FilterContext,
     filter_pass_state: &'a mut FilterPassState,
+    /// When backdrop filters are in use, this holds the intermediate RGBA8
+    /// texture used as the render target. It has `COPY_SRC` so we can copy
+    /// regions for backdrop filter capture.
+    backdrop_texture: Option<Texture>,
 }
+
 
 impl RendererContext<'_> {
     /// Render the strips to the specified render target.
@@ -2339,6 +2429,13 @@ impl RendererContext<'_> {
 
         let pipeline_idx = match target {
             StripPassRenderTarget::Output(OutputTarget::IntermediateTexture(_)) => 1,
+            // When rendering to the backdrop intermediate texture (which is RGBA8),
+            // use pipeline[1] (RGBA8 format) instead of pipeline[0] (native format).
+            StripPassRenderTarget::Output(OutputTarget::FinalView)
+                if self.backdrop_texture.is_some() =>
+            {
+                1
+            }
             _ => 0,
         };
 
@@ -2435,6 +2532,67 @@ impl RendererBackend for RendererContext<'_> {
             LoadOp::Clear => wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         };
         self.do_strip_render_pass(strips, target, wgpu_load_op);
+    }
+
+    fn capture_backdrop(&mut self, layer_id: LayerId, wtile_bbox: WideTilesBbox) {
+        let Some(ref backdrop_tex) = self.backdrop_texture else {
+            // No intermediate texture available for capture. This shouldn't happen
+            // if the scene was set up correctly with backdrop filters.
+            return;
+        };
+
+        let Some(filter_textures) = self.filter_context.filter_textures.get(&layer_id) else {
+            return;
+        };
+        let Some(initial_resource) = self
+            .filter_context
+            .image_cache
+            .get(filter_textures.initial_image_id)
+        else {
+            return;
+        };
+
+        let atlas_idx = initial_resource.atlas_id.as_u32() as usize;
+        let filter_atlas = &self.programs.resources.filter_atlas;
+
+        // Calculate the source region in the output texture (pixel coordinates).
+        let src_x = wtile_bbox.x0() as u32 * WideTile::WIDTH as u32;
+        let src_y = wtile_bbox.y0() as u32 * Tile::HEIGHT as u32;
+        let width = wtile_bbox.width_px() as u32;
+        let height = wtile_bbox.height_px() as u32;
+
+        // Destination offset in the filter atlas (where the initial image lives).
+        let dst_x = initial_resource.offset[0] as u32;
+        let dst_y = initial_resource.offset[1] as u32;
+
+        // Copy the region from the intermediate output texture to the filter atlas.
+        self.encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: backdrop_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: src_x,
+                    y: src_y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &filter_atlas.textures[atlas_idx],
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: dst_x,
+                    y: dst_y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     fn apply_filter(&mut self, layer_id: LayerId) {
